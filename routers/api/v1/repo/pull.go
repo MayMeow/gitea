@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"code.gitea.io/gitea/models"
 	"code.gitea.io/gitea/modules/auth"
@@ -18,7 +19,6 @@ import (
 	api "code.gitea.io/gitea/modules/structs"
 	"code.gitea.io/gitea/modules/timeutil"
 	issue_service "code.gitea.io/gitea/services/issue"
-	milestone_service "code.gitea.io/gitea/services/milestone"
 	pull_service "code.gitea.io/gitea/services/pull"
 )
 
@@ -327,7 +327,7 @@ func CreatePullRequest(ctx *context.APIContext, form api.CreatePullRequestOption
 func EditPullRequest(ctx *context.APIContext, form api.EditPullRequestOption) {
 	// swagger:operation PATCH /repos/{owner}/{repo}/pulls/{index} repository repoEditPullRequest
 	// ---
-	// summary: Update a pull request
+	// summary: Update a pull request. If using deadline only the date will be taken into account, and time of day ignored.
 	// consumes:
 	// - application/json
 	// produces:
@@ -386,9 +386,15 @@ func EditPullRequest(ctx *context.APIContext, form api.EditPullRequestOption) {
 		issue.Content = form.Body
 	}
 
-	// Update Deadline
-	if form.Deadline != nil {
-		deadlineUnix := timeutil.TimeStamp(form.Deadline.Unix())
+	// Update or remove deadline if set
+	if form.Deadline != nil || form.RemoveDeadline != nil {
+		var deadlineUnix timeutil.TimeStamp
+		if (form.RemoveDeadline == nil || !*form.RemoveDeadline) && !form.Deadline.IsZero() {
+			deadline := time.Date(form.Deadline.Year(), form.Deadline.Month(), form.Deadline.Day(),
+				23, 59, 59, 0, form.Deadline.Location())
+			deadlineUnix = timeutil.TimeStamp(deadline.Unix())
+		}
+
 		if err := models.UpdateIssueDeadline(issue, deadlineUnix, ctx.User); err != nil {
 			ctx.Error(500, "UpdateIssueDeadline", err)
 			return
@@ -420,7 +426,7 @@ func EditPullRequest(ctx *context.APIContext, form api.EditPullRequestOption) {
 		issue.MilestoneID != form.Milestone {
 		oldMilestoneID := issue.MilestoneID
 		issue.MilestoneID = form.Milestone
-		if err = milestone_service.ChangeMilestoneAssign(issue, ctx.User, oldMilestoneID); err != nil {
+		if err = issue_service.ChangeMilestoneAssign(issue, ctx.User, oldMilestoneID); err != nil {
 			ctx.Error(500, "ChangeMilestoneAssign", err)
 			return
 		}
@@ -619,6 +625,18 @@ func MergePullRequest(ctx *context.APIContext, form auth.MergePullRequestForm) {
 	if err := pull_service.Merge(pr, ctx.User, ctx.Repo.GitRepo, models.MergeStyle(form.Do), message); err != nil {
 		if models.IsErrInvalidMergeStyle(err) {
 			ctx.Status(405)
+			return
+		} else if models.IsErrMergeConflicts(err) {
+			conflictError := err.(models.ErrMergeConflicts)
+			ctx.JSON(http.StatusConflict, conflictError)
+		} else if models.IsErrRebaseConflicts(err) {
+			conflictError := err.(models.ErrRebaseConflicts)
+			ctx.JSON(http.StatusConflict, conflictError)
+		} else if models.IsErrMergeUnrelatedHistories(err) {
+			conflictError := err.(models.ErrMergeUnrelatedHistories)
+			ctx.JSON(http.StatusConflict, conflictError)
+		} else if models.IsErrMergePushOutOfDate(err) {
+			ctx.Status(http.StatusConflict)
 			return
 		}
 		ctx.Error(500, "Merge", err)

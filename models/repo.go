@@ -36,6 +36,7 @@ import (
 	api "code.gitea.io/gitea/modules/structs"
 	"code.gitea.io/gitea/modules/sync"
 	"code.gitea.io/gitea/modules/timeutil"
+	"code.gitea.io/gitea/modules/util"
 
 	"github.com/mcuadros/go-version"
 	"github.com/unknwon/com"
@@ -708,17 +709,17 @@ func (repo *Repository) IsOwnedBy(userID int64) bool {
 }
 
 func (repo *Repository) updateSize(e Engine) error {
-	repoInfoSize, err := git.GetRepoSize(repo.repoPath(e))
+	size, err := util.GetDirectorySize(repo.repoPath(e))
 	if err != nil {
 		return fmt.Errorf("UpdateSize: %v", err)
 	}
 
-	repo.Size = repoInfoSize.Size + repoInfoSize.SizePack
+	repo.Size = size
 	_, err = e.ID(repo.ID).Cols("size").Update(repo)
 	return err
 }
 
-// UpdateSize updates the repository size, calculating it using git.GetRepoSize
+// UpdateSize updates the repository size, calculating it using util.GetDirectorySize
 func (repo *Repository) UpdateSize() error {
 	return repo.updateSize(x)
 }
@@ -1447,14 +1448,17 @@ func createRepository(e *xorm.Session, doer, u *User, repo *Repository) (err err
 	}
 	u.NumRepos++
 
-	// Give access to all members in owner team.
+	// Give access to all members in teams with access to all repositories.
 	if u.IsOrganization() {
-		t, err := u.getOwnerTeam(e)
-		if err != nil {
-			return fmt.Errorf("getOwnerTeam: %v", err)
+		if err := u.GetTeams(); err != nil {
+			return fmt.Errorf("GetTeams: %v", err)
 		}
-		if err = t.addRepository(e, repo); err != nil {
-			return fmt.Errorf("addRepository: %v", err)
+		for _, t := range u.Teams {
+			if t.IncludesAllRepositories {
+				if err := t.addRepository(e, repo); err != nil {
+					return fmt.Errorf("addRepository: %v", err)
+				}
+			}
 		}
 	} else if err = repo.recalculateAccesses(e); err != nil {
 		// Organization automatically called this in addRepository method.
@@ -1466,8 +1470,15 @@ func createRepository(e *xorm.Session, doer, u *User, repo *Repository) (err err
 			return fmt.Errorf("watchRepo: %v", err)
 		}
 	}
-	if err = newRepoAction(e, doer, repo); err != nil {
-		return fmt.Errorf("newRepoAction: %v", err)
+	if err = notifyWatchers(e, &Action{
+		ActUserID: doer.ID,
+		ActUser:   doer,
+		OpType:    ActionCreateRepo,
+		RepoID:    repo.ID,
+		Repo:      repo,
+		IsPrivate: repo.IsPrivate,
+	}); err != nil {
+		return fmt.Errorf("notify watchers '%d/%d': %v", doer.ID, repo.ID, err)
 	}
 
 	if err = copyDefaultWebhooksToRepo(e, repo.ID); err != nil {
@@ -1641,11 +1652,15 @@ func TransferOwnership(doer *User, newOwnerName string, repo *Repository) error 
 	}
 
 	if newOwner.IsOrganization() {
-		t, err := newOwner.getOwnerTeam(sess)
-		if err != nil {
-			return fmt.Errorf("getOwnerTeam: %v", err)
-		} else if err = t.addRepository(sess, repo); err != nil {
-			return fmt.Errorf("add to owner team: %v", err)
+		if err := newOwner.GetTeams(); err != nil {
+			return fmt.Errorf("GetTeams: %v", err)
+		}
+		for _, t := range newOwner.Teams {
+			if t.IncludesAllRepositories {
+				if err := t.addRepository(sess, repo); err != nil {
+					return fmt.Errorf("addRepository: %v", err)
+				}
+			}
 		}
 	} else if err = repo.recalculateAccesses(sess); err != nil {
 		// Organization called this in addRepository method.
@@ -2396,8 +2411,8 @@ func CheckRepoStats() {
 	checkers := []*repoChecker{
 		// Repository.NumWatches
 		{
-			"SELECT repo.id FROM `repository` repo WHERE repo.num_watches!=(SELECT COUNT(*) FROM `watch` WHERE repo_id=repo.id)",
-			"UPDATE `repository` SET num_watches=(SELECT COUNT(*) FROM `watch` WHERE repo_id=?) WHERE id=?",
+			"SELECT repo.id FROM `repository` repo WHERE repo.num_watches!=(SELECT COUNT(*) FROM `watch` WHERE repo_id=repo.id AND mode<>2)",
+			"UPDATE `repository` SET num_watches=(SELECT COUNT(*) FROM `watch` WHERE repo_id=? AND mode<>2) WHERE id=?",
 			"repository count 'num_watches'",
 		},
 		// Repository.NumStars
@@ -2825,4 +2840,10 @@ func (repo *Repository) GetTreePathLock(treePath string) (*LFSLock, error) {
 		}
 	}
 	return nil, nil
+}
+
+// UpdateRepositoryCols updates repository's columns
+func UpdateRepositoryCols(repo *Repository, cols ...string) error {
+	_, err := x.ID(repo.ID).Cols(cols...).Update(repo)
+	return err
 }
